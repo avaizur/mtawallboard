@@ -1,0 +1,114 @@
+on:
+  pull_request:
+    branches:
+      - main
+
+name: Review
+
+jobs:
+  deploy:
+    name: Deploy to Amazon ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 2
+
+      - name: Get branch name
+        uses: nelonoel/branch-name@v1.0.1
+
+      - name: Extract branch name
+        id: github-branch
+        run: echo "::set-output name=branch::$(echo ${GITHUB_HEAD_REF})"
+
+      - name: Configure environment name
+        id: env-name
+        env:
+          REPO: ${{ github.event.repository.name }}
+          BRANCH_NAME: ${{ steps.github-branch.outputs.branch }}
+        run: |
+          ENVIRONMENT=`echo $REPO-$BRANCH_NAME | tr "/" "-"`
+          echo "Environment name: $ENVIRONMENT"
+          echo "::set-output name=environment::$ENVIRONMENT"
+
+      - name: Get commit hash
+        id: commit-hash
+        run: |
+          COMMITHASH=`git rev-parse --short $GITHUB_SHA`
+          echo "Commit hash: $COMMITHASH"
+          echo "::set-output name=hash::$COMMITHASH"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.REVIEW_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.REVIEW_AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-2
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.env-name.outputs.environment }}-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Retrieve default VPC ID and public subnets
+        id: vpc
+        run: |
+          VPC_ID=`aws ec2 describe-vpcs --filters "Name=isDefault, Values=true" --query 'Vpcs[].VpcId' --output text`
+          echo "::set-output name=vpc-id::$VPC_ID"
+          SUBNET_1=`aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:IsPublic,Values=true" --query 'Subnets[0].SubnetId' --output text`
+          echo "::set-output name=subnet-one::$SUBNET_1"
+          SUBNET_2=`aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:IsPublic,Values=true" --query 'Subnets[1].SubnetId' --output text`
+          echo "::set-output name=subnet-two::$SUBNET_2"
+          SUBNET_3=`aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:IsPublic,Values=true" --query 'Subnets[2].SubnetId' --output text`
+          echo "::set-output name=subnet-three::$SUBNET_3"
+
+      - name: Configure ECS Cluster
+        id: ecs-stack
+        uses: aws-actions/aws-cloudformation-github-deploy@v1
+        with:
+          name: ${{ steps.env-name.outputs.environment }}-ecs
+          template: aws/stack.yaml
+          no-fail-on-empty-changeset: "1"
+          capabilities: CAPABILITY_NAMED_IAM
+          parameter-overrides: >-
+            VPC=${{ steps.vpc.outputs.vpc-id }},
+            SubnetA=${{ steps.vpc.outputs.subnet-one }},
+            SubnetB=${{ steps.vpc.outputs.subnet-two }},
+            SubnetC=${{ steps.vpc.outputs.subnet-three }},
+            Certificate=${{ secrets.TLS_CERTIFICATE }},
+            Image=${{ steps.build-image.outputs.image }},
+            ServiceName=${{ steps.env-name.outputs.environment }},
+            ContainerPort=3000,
+            LoadBalancerPort=443,
+            HostedZoneName=staging.muslimtv.io,
+            NodeEnvironment=preview,
+            JIRAProjectName=VODSTAGING,
+            JIRAAuthUsername=${{ secrets.JIRA_AUTH_USERNAME_REVIEW }},
+            JIRAAuthToken=${{ secrets.JIRA_AUTH_TOKEN_REVIEW }}
+
+      - name: Add endpoint in PR comments
+        uses: actions/github-script@v3
+        env:
+          ENDPOINT: ${{ steps.ecs-stack.outputs.Endpoint }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            let message = `🎉 Preview available for commit ${process.env.GITHUB_SHA}.<br/>${process.env.ENDPOINT}`
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: message
+            })

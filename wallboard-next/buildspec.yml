@@ -1,0 +1,22 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      : 14
+    commands:
+      - npm install -g next
+  pre_build:
+    commands:
+      - npm install
+  build:
+    commands:
+      - next build
+  post_build:
+    commands:
+      - next export
+
+artifacts:
+  files:
+    - out/**/*
+  discard-paths: yes
